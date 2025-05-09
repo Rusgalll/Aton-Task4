@@ -1,0 +1,197 @@
+name: Kittygram Workflow
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:13.10
+        env:
+          POSTGRES_USER: kittygram_user
+          POSTGRES_PASSWORD: kittygram_password
+          POSTGRES_DB: kittygram
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      - name: Install setuptools and wheel
+        run: |
+          python -m pip install --upgrade setuptools wheel pip
+
+      - name: Install Cython
+        run: |
+          python -m pip install cython
+
+      - name: Install system dependencies for building packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpq-dev python3-dev 
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8==6.0.0 flake8-isort==6.0.0
+          pip install -r ./backend/requirements.txt --prefer-binary
+
+      - name: Debug installation process
+        run: |
+          python -m pip install -v -r ./backend/requirements.txt --prefer-binary  
+
+      - name: Check for dependency issues
+        run: |
+          pip check
+
+      - name: Test with flake8
+        run: |
+          python -m flake8 backend/
+
+      - name: Set up NodeJS
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend/
+          npm ci
+
+      - name: Test frontend
+        run: |
+          cd frontend/
+          npm run test
+
+  push_to_docker_hub:
+    name: Push Docker images to DockerHub
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push backend to DockerHub
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend/
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_backend:latest
+
+      - name: Push frontend to DockerHub
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend/
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_frontend:latest
+
+      - name: Push gateway to DockerHub
+        uses: docker/build-push-action@v4
+        with:
+          context: ./nginx/
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_gateway:latest
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: push_to_docker_hub
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v3
+
+      - name: Ensure target directory exists
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_IP }}
+          username: ${{ secrets.HOST_USERNAME }}
+          key: ${{ secrets.HOST_SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          script: |
+            mkdir -p /home/${{ secrets.HOST_USERNAME }}/kittygram
+
+      - name: Copy project files to remote server via SSH
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_IP }}
+          username: ${{ secrets.HOST_USERNAME }}
+          key: ${{ secrets.HOST_SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          source: "."
+          target: "/home/${{ secrets.HOST_USERNAME }}/kittygram"
+
+      - name: Create .env file on remote server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_IP }}
+          username: ${{ secrets.HOST_USERNAME }}
+          key: ${{ secrets.HOST_SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          script: |
+            echo "${{ secrets.ENV_CONTENT }}" > /home/${{ secrets.HOST_USERNAME }}/kittygram/.env
+
+      - name: Execute remote SSH commands to deploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_IP }}
+          username: ${{ secrets.HOST_USERNAME }}
+          key: ${{ secrets.HOST_SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          script: |
+            cd /home/${{ secrets.HOST_USERNAME }}/kittygram
+            sudo docker compose -f docker-compose.yml pull
+            sudo docker compose -f docker-compose.yml down
+            sudo docker compose -f docker-compose.yml up -d
+            sudo docker compose -f docker-compose.yml exec backend python manage.py migrate
+            sudo docker compose -f docker-compose.yml exec backend python manage.py collectstatic --noinput
+            sudo docker compose -f docker-compose.yml exec backend cp -r /app/collected_static/. /app/build/
+
+  auto_tests:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9 
+
+      - name: Install backend dependencies for autotests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ./backend/requirements.txt --prefer-binary
+
+      - name: Run autotests
+        run: |
+          pytest
+
+  telegram_notify:
+    runs-on: ubuntu-latest
+    needs: auto_tests
+    steps:
+      - name: Send Telegram Notification    
+        uses: appleboy/telegram-action@master
+        with:          
+          to: ${{ secrets.TELEGRAM_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}          
+          message: "Деплой проекта ${{ github.repository }} выполнен"
